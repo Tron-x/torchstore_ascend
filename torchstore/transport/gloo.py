@@ -89,6 +89,13 @@ def _gloo_factory(
         pg._register_backend(
             torch.device("cuda"), ProcessGroup.BackendType.GLOO, backend_class
         )
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        try:
+            pg._register_backend(
+                torch.device("npu"), ProcessGroup.BackendType.GLOO, backend_class
+            )
+        except Exception:
+            pass
     return pg
 
 

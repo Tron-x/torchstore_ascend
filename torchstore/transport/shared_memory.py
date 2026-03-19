@@ -52,18 +52,28 @@ MUTABLE_SHM = os.environ.get("TORCHSTORE_MUTABLE_SHM", "0") == "1"
 SHM_ENABLED = os.environ.get("TORCHSTORE_SHARED_MEMORY_ENABLED", "1") == "1"
 
 
-def pin_memory(tensor: torch.Tensor) -> None:
-    """Pin tensor's memory for faster CUDA transfers.
+def _is_npu_available() -> bool:
+    return hasattr(torch, "npu") and torch.npu.is_available()
 
-    Uses cudaHostRegister with cudaHostRegisterPortable flag to make the
-    memory accessible from all CUDA contexts.
+
+def pin_memory(tensor: torch.Tensor) -> None:
+    """Pin tensor's memory for faster device transfers.
+
+    On CUDA: uses cudaHostRegister with cudaHostRegisterPortable flag.
+    On NPU: skipped (no public host-register API in torch_npu).
     """
-    if not SHOULD_PIN_SHM or not torch.cuda.is_available():
+    if not SHOULD_PIN_SHM:
+        return
+
+    if _is_npu_available():
+        return
+
+    if not torch.cuda.is_available():
         return
 
     cudart = torch.cuda.cudart()
     if cudart is None:
-        return  # No CUDA runtime available, skip pinning
+        return
 
     data_ptr = tensor.data_ptr()
     size = tensor.numel() * tensor.element_size()
@@ -80,7 +90,13 @@ def pin_memory(tensor: torch.Tensor) -> None:
 
 def unpin_memory(tensor: torch.Tensor) -> None:
     """Unpin tensor's memory."""
-    if not SHOULD_PIN_SHM or not torch.cuda.is_available():
+    if not SHOULD_PIN_SHM:
+        return
+
+    if _is_npu_available():
+        return
+
+    if not torch.cuda.is_available():
         return
 
     cudart = torch.cuda.cudart()
@@ -326,7 +342,7 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             if not tensor.is_contiguous():
                 tensor = tensor.cpu().contiguous()
 
-            if tensor.is_cuda:
+            if tensor.is_cuda or getattr(tensor, "is_npu", False):
                 devices_to_sync.add(tensor.device)
 
             if descriptor is not None:
@@ -345,10 +361,13 @@ class SharedMemoryTransportBuffer(TransportBuffer):
             shm_tensor.copy_(tensor, non_blocking=True)
         latency_tracker.track_step("alloc_and_copy")
 
-        # Wait for async copies (GPU->CPU DMA) on involved devices only
+        # Wait for async copies (device->CPU DMA) on involved devices only
         for device in devices_to_sync:
-            torch.cuda.synchronize(device)
-        latency_tracker.track_step("cuda_synchronize")
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elif device.type == "npu":
+                torch.npu.synchronize(device)
+        latency_tracker.track_step("device_synchronize")
 
     async def handle_put_request(
         self,
