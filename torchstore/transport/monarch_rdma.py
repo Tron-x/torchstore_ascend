@@ -14,18 +14,27 @@ try:
     from monarch.rdma import RDMABuffer
 
     try:
-        # monarch >= 0.4.0
-        from monarch.rdma import is_ibverbs_available as monarch_rdma_available
+        # Preferred: rdma_supported detects ibverbs, HiXL, and TCP fallback
+        from monarch._rust_bindings.rdma import rdma_supported as _rdma_backend_available
     except ImportError:
-        # monarch < 0.4.0
-        from monarch.rdma import is_rdma_available as monarch_rdma_available
+        try:
+            # monarch >= 0.4.0
+            from monarch.rdma import is_ibverbs_available as _rdma_backend_available
+        except ImportError:
+            # monarch < 0.4.0
+            from monarch.rdma import is_rdma_available as _rdma_backend_available
 except ImportError:
-    monarch_rdma_available = lambda: False
+    _rdma_backend_available = lambda: False
 
     def RDMABuffer(*args: Any, **kwargs: Any) -> Any:
         raise NotImplementedError(
             "RDMABuffer is not available. This environment was likely not built with rdma support."
         )
+
+
+def monarch_rdma_available() -> bool:
+    """Check if any Monarch RDMA backend is available (ibverbs, HiXL, or TCP fallback)."""
+    return _rdma_backend_available()
 
 
 from torchstore.transport.buffers import TransportBuffer

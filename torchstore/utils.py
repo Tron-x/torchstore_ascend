@@ -125,12 +125,24 @@ def get_local_hostname() -> str:
     return os.environ.get("HOSTNAME", socket.gethostname())
 
 
+def _detect_accelerator_dim() -> str:
+    """Detect the accelerator type available on this host."""
+    try:
+        import torch_npu  # noqa: F401
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            return "npus"
+    except ImportError:
+        pass
+    return "gpus"
+
+
 async def spawn_actors(num_processes, actor_cls, name, mesh=None, **init_args):
     """Actors are essentially processes wrapped in a class."""
 
     if mesh is None:
         logger.debug("Spawning actors on the local host")
-        mesh = this_host().spawn_procs(per_host={"gpus": num_processes})
+        accel_dim = _detect_accelerator_dim()
+        mesh = this_host().spawn_procs(per_host={accel_dim: num_processes})
 
     assert hasattr(mesh, "spawn")
     await mesh.initialized

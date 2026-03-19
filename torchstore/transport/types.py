@@ -11,7 +11,14 @@ from typing import Any
 
 import torch
 from torch.distributed.tensor import DTensor
-from torch.distributed.tensor._utils import _compute_local_shape_and_global_offset
+try:
+    from torch.distributed.tensor._utils import (
+        _compute_local_shape_and_global_offset,
+    )
+except ImportError:
+    from torch.distributed.tensor._utils import (
+        compute_local_shape_and_global_offset as _compute_local_shape_and_global_offset,
+    )
 from torch.distributed.tensor.placement_types import Replicate
 
 logger = getLogger(__name__)
