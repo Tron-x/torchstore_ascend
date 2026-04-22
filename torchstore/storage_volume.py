@@ -33,6 +33,17 @@ class StorageVolume(Actor):
     ) -> None:
         self.store: StorageImpl = InMemoryStore()
         self.volume_id: str = id_func()
+        # Optional collective-broadcast process group. Installed lazily
+        # via ``init_bcast_group`` when a consumer (e.g. forge's
+        # ``CollectiveBroadcastBackend``) wants this volume to reflect
+        # its locally-stored tensors out to a set of remote peers over
+        # HCCL/NCCL instead of them each doing their own ``ts.get``.
+        # The volume still accepts regular ``put``/``get`` traffic on
+        # its MonarchRDMA transport side; the bcast group sits on a
+        # separate ``torch.distributed`` backend (HCCL on Ascend NPU,
+        # NCCL on CUDA).  See
+        # ``forge/docs/weight_sync.md §7.4`` for the design rationale.
+        self._bcast_pg = None  # type: ignore[var-annotated]
 
     @classmethod
     async def spawn(
@@ -91,6 +102,207 @@ class StorageVolume(Actor):
     @endpoint
     async def reset(self) -> None:
         self.store.reset()
+
+    # ------------------------------------------------------------------
+    # Collective-broadcast reflector endpoints
+    # ------------------------------------------------------------------
+    #
+    # The three endpoints below let an external consumer (forge's
+    # ``CollectiveBroadcastBackend``) turn a storage volume into a
+    # broadcast source: after the trainer has ``ts.put``-ed a tensor
+    # into this volume's ``InMemoryStore``, the consumer calls
+    # ``init_bcast_group`` to rendezvous this volume with the target
+    # peers (e.g. inference TP workers), then ``bcast_tensor(key)`` to
+    # broadcast the locally-stored tensor over HCCL/NCCL to those
+    # peers in a single collective operation.
+    #
+    # This is strictly additive -- volumes that never call
+    # ``init_bcast_group`` behave exactly as before.  Volumes that do
+    # still accept regular ``put`` / ``get`` traffic concurrently with
+    # any bcast work, because the two transports live on separate
+    # backends (torchstore's MonarchRDMA vs stock torch.distributed
+    # HCCL/NCCL).
+    @endpoint
+    async def init_bcast_group(
+        self,
+        master_addr: str,
+        master_port: int,
+        world_size: int,
+        rank: int,
+        backend: str = "hccl",
+        group_name: str = "torchstore_bcast_reflector",
+        timeout_s: int = 180,
+    ) -> dict:
+        """Rendezvous this volume into a ``torch.distributed`` process
+        group so later calls to :meth:`bcast_tensor` broadcast from
+        this volume to the other ranks in the group.
+
+        Only one bcast group per volume is supported; calling twice is
+        a no-op on the second call.
+        """
+        import datetime
+
+        import torch.distributed as dist
+
+        if self._bcast_pg is not None:
+            return {
+                "already_initialized": True,
+                "rank": rank,
+                "world_size": world_size,
+            }
+
+        # We use the default-PG init path (instead of
+        # ``_new_process_group_helper`` gymnastics) because storage
+        # volumes are plain Monarch actors that don't have a pre-existing
+        # default PG.  First volume to hit this wins the default slot;
+        # subsequent groups in the same proc would need ``new_group``,
+        # which we'll add if the design ever needs multiple bcast
+        # groups per volume.
+        # Both legs of the bcast group (storage vol here, TP workers in
+        # forge's WorkerWrapper) must use the SAME ``group_name`` so
+        # torch.distributed's PrefixStore scoping puts their
+        # ``hcclUniqueId`` rendezvous keys under a matching prefix.
+        # The worker side already uses a custom (non-default) PG because
+        # vLLM has a default PG; for symmetry we do the same on the
+        # storage side so the prefix is consistent across both ranks.
+        # We vendor ``init_custom_process_group`` from AReaL (not
+        # torchstore's normal dep) only if available; otherwise fall
+        # back to default init_process_group, which works as long as no
+        # other PG exists in the proc.
+        try:
+            from areal.engine.core.distributed import init_custom_process_group
+
+            self._bcast_pg = init_custom_process_group(
+                backend=backend,
+                init_method=f"tcp://{master_addr}:{master_port}",
+                world_size=world_size,
+                rank=rank,
+                group_name=group_name,
+                timeout=datetime.timedelta(seconds=timeout_s),
+            )
+        except ImportError:
+            if not dist.is_initialized():
+                dist.init_process_group(
+                    backend=backend,
+                    init_method=f"tcp://{master_addr}:{master_port}",
+                    world_size=world_size,
+                    rank=rank,
+                    timeout=datetime.timedelta(seconds=timeout_s),
+                )
+            self._bcast_pg = dist.group.WORLD
+
+        # Run a tiny all_reduce so the HCCL / NCCL communicator is
+        # actually constructed here, not only on the first real bcast.
+        # Without this the worker-side rank-0 lookup races the first
+        # real collective and can time out waiting for the
+        # ``hcclUniqueId`` to appear in the TCPStore rendezvous --
+        # torch.distributed only eagerly builds the communicator on
+        # the first collective call on each rank.
+        import torch
+
+        # Storage volumes have exactly one visible NPU (they're
+        # bootstrapped with ASCEND_RT_VISIBLE_DEVICES masking), so
+        # logical device 0 always refers to "our NPU".  For CUDA
+        # volumes the same single-visible-device invariant holds.
+        if backend == "hccl" and hasattr(torch, "npu") and torch.npu.is_available():
+            device = torch.device("npu", 0)
+        elif backend == "nccl" and torch.cuda.is_available():
+            device = torch.device("cuda", 0)
+        else:
+            device = torch.device("cpu")
+        probe = torch.ones(8, dtype=torch.float32, device=device)
+        dist.all_reduce(probe, group=self._bcast_pg)
+        if device.type == "npu":
+            torch.npu.synchronize()
+        elif device.type == "cuda":
+            torch.cuda.synchronize()
+        return {
+            "rank": rank,
+            "world_size": world_size,
+            "probe_sum": float(probe.sum().item()),
+        }
+
+    @endpoint
+    async def bcast_tensor(self, key: str) -> dict:
+        """Broadcast the tensor stored under ``key`` on this volume to
+        every peer in the bcast group.  Must be called after
+        :meth:`init_bcast_group` and must be matched by a
+        ``dist.broadcast`` call on every peer rank with ``src=<this
+        volume's rank>``.
+        """
+        import time
+
+        import torch
+        import torch.distributed as dist
+
+        if self._bcast_pg is None:
+            raise RuntimeError(
+                "bcast_tensor called before init_bcast_group; "
+                "the bcast group must be set up first"
+            )
+        # ``InMemoryStore`` keys either a Tensor (regular case), a
+        # ``{"obj": ...}`` wrapper (ts.put on non-tensor), or a
+        # coord-indexed dict (DTensor shards).  We only support plain
+        # tensor values here -- forge's flat-buffer path stores exactly
+        # that shape.  Error clearly if the caller asks us to bcast
+        # something we can't.
+        store = self.store
+        if not hasattr(store, "kv"):
+            raise RuntimeError(
+                "bcast_tensor only supports InMemoryStore-backed volumes"
+            )
+        val = store.kv.get(key)
+        if val is None:
+            raise KeyError(
+                f"key '{key}' not found on volume {self.volume_id}; "
+                f"caller should ensure ts.put landed before bcast"
+            )
+        if not isinstance(val, torch.Tensor):
+            raise TypeError(
+                f"key '{key}' maps to {type(val).__name__}, not Tensor; "
+                "bcast_tensor cannot broadcast non-tensor storage entries"
+            )
+
+        # NOTE: ``dist.get_rank(pg)`` hits a default-PG check on
+        # torch_npu's build even when called with an explicit group
+        # handle (the wrapper short-circuits to ``_get_default_group``).
+        # Since volumes in this design always occupy rank 0 of the
+        # bcast group (set by the caller in ``init_bcast_group``), it's
+        # sufficient -- and safer -- to broadcast from ``src=0``.  If
+        # this ever needs to be the non-0 rank, track the rank in an
+        # instance variable set during ``init_bcast_group``.
+        t0 = time.perf_counter()
+        dist.broadcast(val, src=0, group=self._bcast_pg)
+        if val.is_cuda or (hasattr(torch, "npu") and val.device.type == "npu"):
+            # Synchronize so the caller's timing reflects completion,
+            # not just queueing onto the stream.
+            if val.device.type == "npu":
+                torch.npu.synchronize()
+            else:
+                torch.cuda.synchronize()
+        elapsed = time.perf_counter() - t0
+        return {
+            "bytes": int(val.numel() * val.element_size()),
+            "bcast_s": elapsed,
+            # Volumes are always rank 0 in this design (see note on the
+            # broadcast call above); avoiding ``dist.get_rank(pg)`` here
+            # sidesteps torch_npu's default-PG check.
+            "src_rank": 0,
+        }
+
+    @endpoint
+    async def shutdown_bcast_group(self) -> dict:
+        import torch.distributed as dist
+
+        if self._bcast_pg is None:
+            return {"ok": True, "was_initialized": False}
+        # Destroying the default PG invalidates future default-PG
+        # collectives in this proc.  That's fine -- storage volumes
+        # don't use torch.distributed for anything else.
+        if dist.is_initialized():
+            dist.destroy_process_group()
+        self._bcast_pg = None
+        return {"ok": True, "was_initialized": True}
 
 
 class StorageImpl:
